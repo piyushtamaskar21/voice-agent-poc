@@ -2,73 +2,198 @@
 <html>
 
 <head>
-    <title>LeadGen POC</title>
+    <title>LeadGen Engine — Indic POC</title>
+    <style>
+        body {
+            font-family: sans-serif;
+            text-align: center;
+            padding: 50px;
+            background: #0f1117;
+            color: #e0e0e0;
+        }
+
+        .card {
+            background: #1a1d27;
+            padding: 40px;
+            border-radius: 15px;
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4);
+            display: inline-block;
+            min-width: 360px;
+        }
+
+        h1 {
+            margin-bottom: 6px;
+            font-size: 24px;
+        }
+
+        .subtitle {
+            color: #888;
+            font-size: 13px;
+            margin-bottom: 28px;
+        }
+
+        label {
+            display: block;
+            text-align: left;
+            font-size: 12px;
+            color: #888;
+            margin-bottom: 6px;
+        }
+
+        select {
+            width: 100%;
+            padding: 10px 14px;
+            font-size: 14px;
+            border-radius: 8px;
+            border: 1px solid #333;
+            background: #0f1117;
+            color: #e0e0e0;
+            margin-bottom: 20px;
+            cursor: pointer;
+            appearance: none;
+        }
+
+        button {
+            width: 100%;
+            padding: 14px;
+            font-size: 16px;
+            cursor: pointer;
+            border-radius: 8px;
+            border: none;
+            background: #4f6ef7;
+            color: white;
+            font-weight: 600;
+            transition: opacity 0.2s;
+        }
+
+        button:hover {
+            opacity: 0.85;
+        }
+
+        button:disabled {
+            opacity: 0.4;
+            cursor: not-allowed;
+        }
+
+        #status {
+            margin-top: 18px;
+            font-size: 13px;
+            color: #888;
+        }
+
+        #status.connected {
+            color: #4ade80;
+        }
+
+        #status.error {
+            color: #f87171;
+        }
+
+        .lang-badge {
+            display: inline-block;
+            margin-top: 10px;
+            padding: 4px 12px;
+            border-radius: 20px;
+            font-size: 11px;
+            font-weight: 600;
+            background: #2a2d3a;
+            color: #a78bfa;
+        }
+    </style>
 </head>
 
-<body style="font-family: sans-serif; text-align: center; padding: 50px; background: #fafafa;">
-    <div
-        style="background: white; padding: 40px; border-radius: 15px; box-shadow: 0 4px 10px rgba(0,0,0,0.1); display: inline-block;">
-        <h1>LeadGen Engine</h1>
-        <button id="startBtn"
-            style="padding: 15px 30px; font-size: 18px; cursor: pointer; border-radius: 8px; border: none; background: #007bff; color: white;">Start
-            Conversation</button>
-        <p id="status" style="margin-top: 20px; font-weight: bold;">Status: Idle</p>
+<body>
+    <div class="card">
+        <h1>🎙️ LeadGen Engine</h1>
+        <p class="subtitle">Indic Language Voice AI · POC</p>
+
+        <label for="langSelect">Select Conversation Language</label>
+        <select id="langSelect">
+            <option value="en">🇺🇸 English — Jessica (ElevenLabs)</option>
+            <option value="hi">🇮🇳 Hindi — Bulbul v2 (Sarvam AI)</option>
+            <option value="mr">🇮🇳 Marathi — Bulbul v2 (Sarvam AI)</option>
+        </select>
+
+        <button id="startBtn">Start Conversation</button>
+
+        <p id="status">Status: Idle</p>
+        <span class="lang-badge" id="langBadge">English · Deepgram STT</span>
     </div>
 
     <script>
         const btn = document.getElementById('startBtn');
         const status = document.getElementById('status');
+        const langSelect = document.getElementById('langSelect');
+        const langBadge = document.getElementById('langBadge');
+
+        const badgeMap = {
+            en: 'English · Deepgram STT + ElevenLabs TTS',
+            hi: 'Hindi · Sarvam Shuka STT + Bulbul v2 TTS',
+            mr: 'Marathi · Sarvam Shuka STT + Bulbul v2 TTS',
+        };
+
+        langSelect.onchange = () => {
+            langBadge.textContent = badgeMap[langSelect.value];
+        };
 
         btn.onclick = async () => {
-            status.innerText = "Connecting...";
-            // Force AudioContext start
+            const lang = langSelect.value;
+            btn.disabled = true;
+            langSelect.disabled = true;
+            status.textContent = 'Connecting...';
+            status.className = '';
+
             const audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
             if (audioCtx.state === 'suspended') await audioCtx.resume();
 
-            const ws = new WebSocket(`ws://${window.location.host}/ws`);
+            // Pass language as query param so server knows before any audio arrives
+            const ws = new WebSocket(`ws://${window.location.host}/ws?lang=${lang}`);
             ws.binaryType = 'arraybuffer';
 
             ws.onopen = () => {
-                console.log("WebSocket connected!");
-                status.innerText = "Connected! Start talking.";
-                status.style.color = "green";
+                status.textContent = `Connected · Speaking ${langSelect.options[langSelect.selectedIndex].text.split('—')[0].trim()}`;
+                status.className = 'connected';
             };
 
             ws.onmessage = async (e) => {
-                console.log("Received audio chunk, size:", e.data.byteLength);
+                if (!(e.data instanceof ArrayBuffer)) return;
                 try {
-                    const audioBuffer = await audioCtx.decodeAudioData(e.data);
-                    const playSource = audioCtx.createBufferSource();
-                    playSource.buffer = audioBuffer;
-                    playSource.connect(audioCtx.destination);
-                    playSource.start();
-                } catch (err) { console.error("Playback Error", err); }
+                    const audioBuffer = await audioCtx.decodeAudioData(e.data.slice(0));
+                    const src = audioCtx.createBufferSource();
+                    src.buffer = audioBuffer;
+                    src.connect(audioCtx.destination);
+                    src.start();
+                } catch (err) { console.warn('Playback error', err); }
             };
 
-            ws.onerror = (err) => console.error("WebSocket Error:", err);
+            ws.onerror = () => {
+                status.textContent = 'Connection error';
+                status.className = 'error';
+                btn.disabled = false;
+                langSelect.disabled = false;
+            };
+
             ws.onclose = () => {
-                console.log("WebSocket closed");
-                status.innerText = "Disconnected";
-                status.style.color = "red";
+                status.textContent = 'Disconnected';
+                status.className = 'error';
+                btn.disabled = false;
+                langSelect.disabled = false;
             };
 
-            // 1. Send Audio (Mic -> Server)
             const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
             const source = audioCtx.createMediaStreamSource(stream);
             const processor = audioCtx.createScriptProcessor(4096, 1, 1);
-
             source.connect(processor);
             processor.connect(audioCtx.destination);
 
             processor.onaudioprocess = (e) => {
-                if (ws.readyState === WebSocket.OPEN) {
-                    const input = e.inputBuffer.getChannelData(0);
-                    const output = new Int16Array(input.length);
-                    for (let i = 0; i < input.length; i++) {
-                        output[i] = Math.max(-1, Math.min(1, input[i])) * 0x7FFF;
-                    }
-                    ws.send(output.buffer);
+                if (ws.readyState !== WebSocket.OPEN) return;
+                const input = e.inputBuffer.getChannelData(0);
+                const output = new Int16Array(input.length);
+                for (let i = 0; i < input.length; i++) {
+                    output[i] = Math.max(-1, Math.min(1, input[i])) * 0x7FFF;
                 }
+                ws.send(output.buffer);
             };
         };
     </script>
