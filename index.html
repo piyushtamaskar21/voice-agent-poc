@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <title>LeadGen POC</title>
+</head>
+
+<body style="font-family: sans-serif; text-align: center; padding: 50px; background: #fafafa;">
+    <div
+        style="background: white; padding: 40px; border-radius: 15px; box-shadow: 0 4px 10px rgba(0,0,0,0.1); display: inline-block;">
+        <h1>LeadGen Engine</h1>
+        <button id="startBtn"
+            style="padding: 15px 30px; font-size: 18px; cursor: pointer; border-radius: 8px; border: none; background: #007bff; color: white;">Start
+            Conversation</button>
+        <p id="status" style="margin-top: 20px; font-weight: bold;">Status: Idle</p>
+    </div>
+
+    <script>
+        const btn = document.getElementById('startBtn');
+        const status = document.getElementById('status');
+
+        btn.onclick = async () => {
+            status.innerText = "Connecting...";
+            // Force AudioContext start
+            const audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+            if (audioCtx.state === 'suspended') await audioCtx.resume();
+
+            const ws = new WebSocket(`ws://${window.location.host}/ws`);
+            ws.binaryType = 'arraybuffer';
+
+            ws.onopen = () => {
+                console.log("WebSocket connected!");
+                status.innerText = "Connected! Start talking.";
+                status.style.color = "green";
+            };
+
+            ws.onmessage = async (e) => {
+                console.log("Received audio chunk, size:", e.data.byteLength);
+                try {
+                    const audioBuffer = await audioCtx.decodeAudioData(e.data);
+                    const playSource = audioCtx.createBufferSource();
+                    playSource.buffer = audioBuffer;
+                    playSource.connect(audioCtx.destination);
+                    playSource.start();
+                } catch (err) { console.error("Playback Error", err); }
+            };
+
+            ws.onerror = (err) => console.error("WebSocket Error:", err);
+            ws.onclose = () => {
+                console.log("WebSocket closed");
+                status.innerText = "Disconnected";
+                status.style.color = "red";
+            };
+
+            // 1. Send Audio (Mic -> Server)
+            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            const source = audioCtx.createMediaStreamSource(stream);
+            const processor = audioCtx.createScriptProcessor(4096, 1, 1);
+
+            source.connect(processor);
+            processor.connect(audioCtx.destination);
+
+            processor.onaudioprocess = (e) => {
+                if (ws.readyState === WebSocket.OPEN) {
+                    const input = e.inputBuffer.getChannelData(0);
+                    const output = new Int16Array(input.length);
+                    for (let i = 0; i < input.length; i++) {
+                        output[i] = Math.max(-1, Math.min(1, input[i])) * 0x7FFF;
+                    }
+                    ws.send(output.buffer);
+                }
+            };
+        };
+    </script>
+</body>
+
+</html>
