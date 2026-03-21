@@ -140,10 +140,8 @@
             const lang = langSelect.value;
             btn.disabled = true;
             langSelect.disabled = true;
-            status.textContent = 'Connecting...';
-            status.className = '';
-
             const audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+            console.log(`[Audio] Context sample rate: ${audioCtx.sampleRate}Hz`);
             if (audioCtx.state === 'suspended') await audioCtx.resume();
 
             // Pass language as query param so server knows before any audio arrives
@@ -156,6 +154,14 @@
             };
 
             ws.onmessage = async (e) => {
+                if (typeof e.data === 'string') {
+                    const msg = JSON.parse(e.data);
+                    if (msg.type === 'session_started') {
+                        console.log('🚀 Session started, enabling mic');
+                        startMic(ws, audioCtx);
+                    }
+                    return;
+                }
                 if (!(e.data instanceof ArrayBuffer)) return;
                 try {
                     const audioBuffer = await audioCtx.decodeAudioData(e.data.slice(0));
@@ -180,20 +186,23 @@
                 langSelect.disabled = false;
             };
 
-            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-            const source = audioCtx.createMediaStreamSource(stream);
-            const processor = audioCtx.createScriptProcessor(4096, 1, 1);
-            source.connect(processor);
-            processor.connect(audioCtx.destination);
+            const startMic = async (socket, context) => {
+                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                const source = context.createMediaStreamSource(stream);
+                // Use 1024 buffer size as a stable middle ground
+                const processor = context.createScriptProcessor(1024, 1, 1);
+                source.connect(processor);
+                processor.connect(context.destination);
 
-            processor.onaudioprocess = (e) => {
-                if (ws.readyState !== WebSocket.OPEN) return;
-                const input = e.inputBuffer.getChannelData(0);
-                const output = new Int16Array(input.length);
-                for (let i = 0; i < input.length; i++) {
-                    output[i] = Math.max(-1, Math.min(1, input[i])) * 0x7FFF;
-                }
-                ws.send(output.buffer);
+                processor.onaudioprocess = (e) => {
+                    if (socket.readyState !== WebSocket.OPEN) return;
+                    const input = e.inputBuffer.getChannelData(0);
+                    const output = new Int16Array(input.length);
+                    for (let i = 0; i < input.length; i++) {
+                        output[i] = Math.max(-1, Math.min(1, input[i])) * 0x7FFF;
+                    }
+                    socket.send(output.buffer);
+                };
             };
         };
     </script>
