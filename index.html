@@ -99,6 +99,72 @@
             background: #2a2d3a;
             color: #a78bfa;
         }
+
+        .meter-container {
+            margin-top: 20px;
+            text-align: left;
+        }
+
+        .meter-label {
+            font-size: 10px;
+            color: #666;
+            margin-bottom: 4px;
+            display: flex;
+            justify-content: space-between;
+        }
+
+        .meter-bar {
+            width: 100%;
+            height: 4px;
+            background: #222;
+            border-radius: 2px;
+            overflow: hidden;
+        }
+
+        .meter-fill {
+            height: 100%;
+            width: 0%;
+            background: #4ade80;
+            transition: width 0.1s;
+        }
+
+        #testAudioBtn {
+            margin-top: 15px;
+            background: #2a2d3a;
+            font-size: 12px;
+            padding: 8px;
+        }
+
+        .transcript-container {
+            margin-top: 24px;
+            background: #000;
+            padding: 15px;
+            border-radius: 8px;
+            min-height: 80px;
+            max-height: 150px;
+            overflow-y: auto;
+            text-align: left;
+            border: 1px solid #333;
+        }
+
+        .transcript-label {
+            font-size: 10px;
+            color: #555;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin-bottom: 8px;
+        }
+
+        #transcriptText {
+            font-size: 14px;
+            line-height: 1.5;
+            color: #fff;
+        }
+
+        .interim {
+            color: #888;
+            font-style: italic;
+        }
     </style>
 </head>
 
@@ -115,6 +181,17 @@
         </select>
 
         <button id="startBtn">Start Conversation</button>
+        <button id="testAudioBtn">🔊 Test System Audio</button>
+
+        <div class="meter-container">
+            <div class="meter-label">Assistant Output <span id="volVal">0%</span></div>
+            <div class="meter-bar"><div id="volFill" class="meter-fill"></div></div>
+        </div>
+
+        <div class="transcript-container">
+            <div class="transcript-label">Live Transcript</div>
+            <div id="transcriptText">Waiting for voice...</div>
+        </div>
 
         <p id="status">Status: Idle</p>
         <span class="lang-badge" id="langBadge">English · Deepgram STT</span>
@@ -140,13 +217,36 @@
             const lang = langSelect.value;
             btn.disabled = true;
             langSelect.disabled = true;
-            const audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+            const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
             console.log(`[Audio] Context sample rate: ${audioCtx.sampleRate}Hz`);
             if (audioCtx.state === 'suspended') await audioCtx.resume();
 
+            const analyser = audioCtx.createAnalyser();
+            analyser.fftSize = 256;
+            analyser.connect(audioCtx.destination);
+            const volFill = document.getElementById('volFill');
+            const volVal = document.getElementById('volVal');
+            const transcriptText = document.getElementById('transcriptText');
+
+            const updateMeter = () => {
+                const data = new Uint8Array(analyser.frequencyBinCount);
+                analyser.getByteFrequencyData(data);
+                let sum = 0;
+                for (let i = 0; i < data.length; i++) sum += data[i];
+                const avg = sum / data.length;
+                const level = Math.min(100, Math.round((avg / 128) * 100));
+                volFill.style.width = level + '%';
+                volVal.textContent = level + '%';
+                requestAnimationFrame(updateMeter);
+            };
+            updateMeter();
+
             // Pass language as query param so server knows before any audio arrives
-            const ws = new WebSocket(`ws://${window.location.host}/ws?lang=${lang}`);
+            const ws = new WebSocket(`ws://${window.location.host}/ws?locale=${lang}`);
             ws.binaryType = 'arraybuffer';
+
+            let nextAudioTime = 0;
+            let activeSources = [];
 
             ws.onopen = () => {
                 status.textContent = `Connected · Speaking ${langSelect.options[langSelect.selectedIndex].text.split('—')[0].trim()}`;
@@ -156,9 +256,42 @@
             ws.onmessage = async (e) => {
                 if (typeof e.data === 'string') {
                     const msg = JSON.parse(e.data);
-                    if (msg.type === 'session_started') {
-                        console.log('🚀 Session started, enabling mic');
+                    if (msg.type === 'session_ready') {
+                        console.log('🚀 Session ready, enabling mic');
                         startMic(ws, audioCtx);
+                    }
+                    if (msg.type === 'user_transcript') {
+                        const text = msg.text || '';
+                        const isFinal = msg.final;
+                        // Use a dedicated 'active-transcript' element for live feedback
+                        let activeLine = document.getElementById('active-line');
+                        if (!activeLine) {
+                            activeLine = document.createElement('div');
+                            activeLine.id = 'active-line';
+                            transcriptText.appendChild(activeLine);
+                        }
+                        activeLine.innerHTML = isFinal ? `<strong>You:</strong> ${text}` : `<span class="interim">You: ${text}...</span>`;
+                        if (isFinal) {
+                            activeLine.id = ''; // Finalize this line
+                        }
+                        transcriptText.scrollTop = transcriptText.scrollHeight;
+                    }
+                    if (msg.type === 'assistant_text') {
+                        const div = document.createElement('div');
+                        div.innerHTML = `<strong>Jessica:</strong> ${msg.text}`;
+                        transcriptText.appendChild(div);
+                        transcriptText.scrollTop = transcriptText.scrollHeight;
+                    }
+                    if (msg.type === 'assistant_audio_start') {
+                        status.textContent = 'Jessica is speaking...';
+                        activeSources.forEach(src => {
+                            try { src.stop(); } catch(e){}
+                        });
+                        activeSources = [];
+                        nextAudioTime = audioCtx.currentTime;
+                    }
+                    if (msg.type === 'assistant_audio_stop') {
+                        status.textContent = `Connected · Speaking ${langSelect.options[langSelect.selectedIndex].text.split('—')[0].trim()}`;
                     }
                     return;
                 }
@@ -167,8 +300,19 @@
                     const audioBuffer = await audioCtx.decodeAudioData(e.data.slice(0));
                     const src = audioCtx.createBufferSource();
                     src.buffer = audioBuffer;
-                    src.connect(audioCtx.destination);
-                    src.start();
+                    src.connect(analyser); // Connect to analyser then destination
+                    
+                    if (nextAudioTime < audioCtx.currentTime) {
+                        nextAudioTime = audioCtx.currentTime;
+                    }
+                    src.start(nextAudioTime);
+                    nextAudioTime += audioBuffer.duration;
+                    
+                    activeSources.push(src);
+                    src.onended = () => {
+                        const idx = activeSources.indexOf(src);
+                        if (idx > -1) activeSources.splice(idx, 1);
+                    };
                 } catch (err) { console.warn('Playback error', err); }
             };
 
@@ -204,6 +348,18 @@
                     socket.send(output.buffer);
                 };
             };
+        };
+
+        document.getElementById('testAudioBtn').onclick = async () => {
+            const ctx = new (window.AudioContext || window.webkitAudioContext)();
+            const osc = ctx.createOscillator();
+            const gain = ctx.createGain();
+            osc.connect(gain);
+            gain.connect(ctx.destination);
+            gain.gain.setValueAtTime(0.1, ctx.currentTime);
+            osc.start();
+            osc.stop(ctx.currentTime + 1);
+            console.log('Test beep played');
         };
     </script>
 </body>
