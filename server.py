@@ -161,15 +161,15 @@ class SessionState:
     async def send_audio_chunk(self, audio_bytes: bytes, fmt: str = "pcm_s16le", sample_rate: int = OUTPUT_SAMPLE_RATE):
         if self.closed or not audio_bytes:
             return
-        
-        # For compatibility with browser's decodeAudioData, wrap PCM in WAV header
-        if fmt.startswith("pcm"):
-            audio_bytes = add_wav_header(audio_bytes, sample_rate)
             
         try:
-            # Re-enable lock for sanity, but keep it tight
-            async with self.send_lock:
-                await self.websocket.send_bytes(audio_bytes)
+            payload = {
+                "type": "assistant_audio_chunk",
+                "audio_b64": base64.b64encode(audio_bytes).decode("ascii"),
+                "format": fmt,
+                "sample_rate": sample_rate
+            }
+            await self.send_json(payload)
         except Exception as e:
             logger.error(f"Failed to send audio bytes: {e}")
 

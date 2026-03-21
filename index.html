@@ -247,6 +247,8 @@
 
             let nextAudioTime = 0;
             let activeSources = [];
+            let isSpeaking = false;
+            let graceTimer = null;
 
             ws.onopen = () => {
                 status.textContent = `Connected · Speaking ${langSelect.options[langSelect.selectedIndex].text.split('—')[0].trim()}`;
@@ -284,6 +286,8 @@
                     }
                     if (msg.type === 'assistant_audio_start') {
                         status.textContent = 'Jessica is speaking...';
+                        isSpeaking = true;
+                        if (graceTimer) clearTimeout(graceTimer);
                         activeSources.forEach(src => {
                             try { src.stop(); } catch(e){}
                         });
@@ -292,28 +296,67 @@
                     }
                     if (msg.type === 'assistant_audio_stop') {
                         status.textContent = `Connected · Speaking ${langSelect.options[langSelect.selectedIndex].text.split('—')[0].trim()}`;
+                        graceTimer = setTimeout(() => {
+                            isSpeaking = false;
+                        }, 800);
+                    }
+                    if (msg.type === 'assistant_audio_chunk') {
+                        const binaryStr = atob(msg.audio_b64);
+                        const len = binaryStr.length;
+                        const bytes = new Uint8Array(len);
+                        for (let i = 0; i < len; i++) {
+                            bytes[i] = binaryStr.charCodeAt(i);
+                        }
+                        const arrayBuffer = bytes.buffer;
+
+                        if (msg.format === 'pcm_s16le') {
+                            const int16Array = new Int16Array(arrayBuffer);
+                            const float32Array = new Float32Array(int16Array.length);
+                            for (let i = 0; i < int16Array.length; i++) {
+                                float32Array[i] = int16Array[i] / 32768.0;
+                            }
+                            const sampleRate = msg.sample_rate || 24000;
+                            const audioBuffer = audioCtx.createBuffer(1, float32Array.length, sampleRate);
+                            audioBuffer.copyToChannel(float32Array, 0);
+
+                            const src = audioCtx.createBufferSource();
+                            src.buffer = audioBuffer;
+                            src.connect(analyser);
+                            if (nextAudioTime < audioCtx.currentTime) {
+                                nextAudioTime = audioCtx.currentTime;
+                            }
+                            src.start(nextAudioTime);
+                            nextAudioTime += audioBuffer.duration;
+                            
+                            activeSources.push(src);
+                            src.onended = () => {
+                                const idx = activeSources.indexOf(src);
+                                if (idx > -1) activeSources.splice(idx, 1);
+                            };
+                        } else {
+                            try {
+                                const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+                                const src = audioCtx.createBufferSource();
+                                src.buffer = audioBuffer;
+                                src.connect(analyser);
+                                if (nextAudioTime < audioCtx.currentTime) {
+                                    nextAudioTime = audioCtx.currentTime;
+                                }
+                                src.start(nextAudioTime);
+                                nextAudioTime += audioBuffer.duration;
+                                
+                                activeSources.push(src);
+                                src.onended = () => {
+                                    const idx = activeSources.indexOf(src);
+                                    if (idx > -1) activeSources.splice(idx, 1);
+                                };
+                            } catch (e) {
+                                console.warn('WAV decode error', e);
+                            }
+                        }
                     }
                     return;
                 }
-                if (!(e.data instanceof ArrayBuffer)) return;
-                try {
-                    const audioBuffer = await audioCtx.decodeAudioData(e.data.slice(0));
-                    const src = audioCtx.createBufferSource();
-                    src.buffer = audioBuffer;
-                    src.connect(analyser); // Connect to analyser then destination
-                    
-                    if (nextAudioTime < audioCtx.currentTime) {
-                        nextAudioTime = audioCtx.currentTime;
-                    }
-                    src.start(nextAudioTime);
-                    nextAudioTime += audioBuffer.duration;
-                    
-                    activeSources.push(src);
-                    src.onended = () => {
-                        const idx = activeSources.indexOf(src);
-                        if (idx > -1) activeSources.splice(idx, 1);
-                    };
-                } catch (err) { console.warn('Playback error', err); }
             };
 
             ws.onerror = () => {
@@ -340,6 +383,7 @@
 
                 processor.onaudioprocess = (e) => {
                     if (socket.readyState !== WebSocket.OPEN) return;
+                    if (isSpeaking) return;
                     const input = e.inputBuffer.getChannelData(0);
                     const output = new Int16Array(input.length);
                     for (let i = 0; i < input.length; i++) {
