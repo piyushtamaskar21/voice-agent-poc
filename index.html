@@ -249,6 +249,7 @@
             let activeSources = [];
             let isSpeaking = false;
             let graceTimer = null;
+            let audioChunks = [];
 
             ws.onopen = () => {
                 status.textContent = `Connected · Speaking ${langSelect.options[langSelect.selectedIndex].text.split('—')[0].trim()}`;
@@ -260,7 +261,7 @@
                     const msg = JSON.parse(e.data);
                     if (msg.type === 'session_ready') {
                         console.log('🚀 Session ready, enabling mic');
-                        startMic(ws, audioCtx);
+                        startMic(ws);
                     }
                     if (msg.type === 'server_error') {
                         console.error('❌ Server Error:', msg.message);
@@ -297,10 +298,42 @@
                             try { src.stop(); } catch(e){}
                         });
                         activeSources = [];
+                        audioChunks = [];
                         nextAudioTime = audioCtx.currentTime;
                     }
                     if (msg.type === 'assistant_audio_stop') {
                         status.textContent = `Connected · Speaking ${langSelect.options[langSelect.selectedIndex].text.split('—')[0].trim()}`;
+                        
+                        if (audioChunks.length > 0) {
+                            const totalLen = audioChunks.reduce((acc, val) => acc + val.length, 0);
+                            const combined = new Uint8Array(totalLen);
+                            let offset = 0;
+                            for (const chunk of audioChunks) {
+                                combined.set(chunk, offset);
+                                offset += chunk.length;
+                            }
+                            
+                            try {
+                                const audioBuffer = await audioCtx.decodeAudioData(combined.buffer);
+                                const src = audioCtx.createBufferSource();
+                                src.buffer = audioBuffer;
+                                src.connect(analyser);
+                                if (nextAudioTime < audioCtx.currentTime + 0.05) {
+                                    nextAudioTime = audioCtx.currentTime + 0.05;
+                                }
+                                src.start(nextAudioTime);
+                                nextAudioTime += audioBuffer.duration;
+                                
+                                activeSources.push(src);
+                                src.onended = () => {
+                                    const idx = activeSources.indexOf(src);
+                                    if (idx > -1) activeSources.splice(idx, 1);
+                                };
+                            } catch (e) {
+                                console.warn('Decode error', e);
+                            }
+                        }
+
                         graceTimer = setTimeout(() => {
                             isSpeaking = false;
                         }, 800);
@@ -312,27 +345,7 @@
                         for (let i = 0; i < len; i++) {
                             bytes[i] = binaryStr.charCodeAt(i);
                         }
-                        const arrayBuffer = bytes.buffer;
-
-                        try {
-                            const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
-                            const src = audioCtx.createBufferSource();
-                            src.buffer = audioBuffer;
-                            src.connect(analyser);
-                            if (nextAudioTime < audioCtx.currentTime + 0.05) {
-                                nextAudioTime = audioCtx.currentTime + 0.05;
-                            }
-                            src.start(nextAudioTime);
-                            nextAudioTime += audioBuffer.duration;
-                            
-                            activeSources.push(src);
-                            src.onended = () => {
-                                const idx = activeSources.indexOf(src);
-                                if (idx > -1) activeSources.splice(idx, 1);
-                            };
-                        } catch (e) {
-                            console.warn('Decode error', e);
-                        }
+                        audioChunks.push(bytes);
                     }
                     return;
                 }
@@ -352,13 +365,15 @@
                 langSelect.disabled = false;
             };
 
-            const startMic = async (socket, context) => {
+            const startMic = async (socket) => {
                 const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-                const source = context.createMediaStreamSource(stream);
+                const micCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+                console.log(`[Audio] Mic context sample rate: ${micCtx.sampleRate}Hz`);
+                const source = micCtx.createMediaStreamSource(stream);
                 // Use 4096 buffer size for ~85ms stable chunks
-                const processor = context.createScriptProcessor(4096, 1, 1);
+                const processor = micCtx.createScriptProcessor(4096, 1, 1);
                 source.connect(processor);
-                processor.connect(context.destination);
+                processor.connect(micCtx.destination);
 
                 processor.onaudioprocess = (e) => {
                     if (socket.readyState !== WebSocket.OPEN) return;
