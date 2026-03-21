@@ -172,27 +172,24 @@
     <div class="card">
         <h1>🎙️ LeadGen Engine</h1>
         <p class="subtitle">Indic Language Voice AI · POC</p>
-
         <label for="langSelect">Select Conversation Language</label>
         <select id="langSelect">
             <option value="en">🇺🇸 English — Jessica (ElevenLabs)</option>
             <option value="hi">🇮🇳 Hindi — Bulbul v2 (Sarvam AI)</option>
             <option value="mr">🇮🇳 Marathi — Bulbul v2 (Sarvam AI)</option>
         </select>
-
         <button id="startBtn">Start Conversation</button>
         <button id="testAudioBtn">🔊 Test System Audio</button>
-
         <div class="meter-container">
             <div class="meter-label">Assistant Output <span id="volVal">0%</span></div>
-            <div class="meter-bar"><div id="volFill" class="meter-fill"></div></div>
+            <div class="meter-bar">
+                <div id="volFill" class="meter-fill"></div>
+            </div>
         </div>
-
         <div class="transcript-container">
             <div class="transcript-label">Live Transcript</div>
             <div id="transcriptText">Waiting for voice...</div>
         </div>
-
         <p id="status">Status: Idle</p>
         <span class="lang-badge" id="langBadge">English · Deepgram STT</span>
     </div>
@@ -205,25 +202,25 @@
 
         const badgeMap = {
             en: 'English · Deepgram STT + ElevenLabs TTS',
-            hi: 'Hindi · Sarvam Shuka STT + Bulbul v2 TTS',
-            mr: 'Marathi · Sarvam Shuka STT + Bulbul v2 TTS',
+            hi: 'Hindi · Sarvam STT + Bulbul v2 TTS',
+            mr: 'Marathi · Sarvam STT + Bulbul v2 TTS',
         };
-
-        langSelect.onchange = () => {
-            langBadge.textContent = badgeMap[langSelect.value];
-        };
+        langSelect.onchange = () => { langBadge.textContent = badgeMap[langSelect.value]; };
 
         btn.onclick = async () => {
             const lang = langSelect.value;
             btn.disabled = true;
             langSelect.disabled = true;
+
+            // PLAYBACK context — default rate (44100/48000 Hz) for ElevenLabs MP3 + Sarvam WAV
             const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-            console.log(`[Audio] Context sample rate: ${audioCtx.sampleRate}Hz`);
+            console.log(`[Playback] ${audioCtx.sampleRate}Hz`);
             if (audioCtx.state === 'suspended') await audioCtx.resume();
 
             const analyser = audioCtx.createAnalyser();
             analyser.fftSize = 256;
             analyser.connect(audioCtx.destination);
+
             const volFill = document.getElementById('volFill');
             const volVal = document.getElementById('volVal');
             const transcriptText = document.getElementById('transcriptText');
@@ -233,121 +230,113 @@
                 analyser.getByteFrequencyData(data);
                 let sum = 0;
                 for (let i = 0; i < data.length; i++) sum += data[i];
-                const avg = sum / data.length;
-                const level = Math.min(100, Math.round((avg / 128) * 100));
+                const level = Math.min(100, Math.round((sum / data.length / 128) * 100));
                 volFill.style.width = level + '%';
                 volVal.textContent = level + '%';
                 requestAnimationFrame(updateMeter);
             };
             updateMeter();
 
-            // Pass language as query param so server knows before any audio arrives
             const ws = new WebSocket(`ws://${window.location.host}/ws?locale=${lang}`);
             ws.binaryType = 'arraybuffer';
 
-            let nextAudioTime = 0;
-            let activeSources = [];
             let isSpeaking = false;
             let graceTimer = null;
-            let audioChunks = [];
+            let audioChunkBuffers = [];  // accumulate raw bytes per turn
+
+            async function playBufferedAudio() {
+                if (audioChunkBuffers.length === 0) {
+                    console.warn('[Audio] No chunks to play');
+                    return;
+                }
+                // Merge all chunk ArrayBuffers into one
+                const totalBytes = audioChunkBuffers.reduce((s, b) => s + b.byteLength, 0);
+                const merged = new Uint8Array(totalBytes);
+                let offset = 0;
+                for (const buf of audioChunkBuffers) {
+                    merged.set(new Uint8Array(buf), offset);
+                    offset += buf.byteLength;
+                }
+                audioChunkBuffers = [];
+                console.log(`[Audio] Decoding ${totalBytes} bytes`);
+
+                try {
+                    // slice(0) gives decodeAudioData a detached copy — required by spec
+                    const decoded = await audioCtx.decodeAudioData(merged.buffer.slice(0));
+                    const src = audioCtx.createBufferSource();
+                    src.buffer = decoded;
+                    src.connect(analyser);
+                    src.start(audioCtx.currentTime + 0.05);
+                    console.log(`[Audio] Playing ${decoded.duration.toFixed(2)}s`);
+                } catch (err) {
+                    console.error('[Audio] decodeAudioData error:', err);
+                }
+            }
 
             ws.onopen = () => {
-                status.textContent = `Connected · Speaking ${langSelect.options[langSelect.selectedIndex].text.split('—')[0].trim()}`;
+                status.textContent = `Connected · ${langSelect.options[langSelect.selectedIndex].text.split('—')[0].trim()}`;
                 status.className = 'connected';
             };
 
             ws.onmessage = async (e) => {
-                if (typeof e.data === 'string') {
-                    const msg = JSON.parse(e.data);
-                    if (msg.type === 'session_ready') {
-                        console.log('🚀 Session ready, enabling mic');
-                        startMic(ws);
-                    }
-                    if (msg.type === 'server_error') {
-                        console.error('❌ Server Error:', msg.message);
-                        status.textContent = `Error: ${msg.message}`;
-                        status.className = 'error';
-                    }
-                    if (msg.type === 'user_transcript') {
-                        const text = msg.text || '';
-                        const isFinal = msg.final;
-                        // Use a dedicated 'active-transcript' element for live feedback
-                        let activeLine = document.getElementById('active-line');
-                        if (!activeLine) {
-                            activeLine = document.createElement('div');
-                            activeLine.id = 'active-line';
-                            transcriptText.appendChild(activeLine);
-                        }
-                        activeLine.innerHTML = isFinal ? `<strong>You:</strong> ${text}` : `<span class="interim">You: ${text}...</span>`;
-                        if (isFinal) {
-                            activeLine.id = ''; // Finalize this line
-                        }
-                        transcriptText.scrollTop = transcriptText.scrollHeight;
-                    }
-                    if (msg.type === 'assistant_text') {
-                        const div = document.createElement('div');
-                        div.innerHTML = `<strong>Jessica:</strong> ${msg.text}`;
-                        transcriptText.appendChild(div);
-                        transcriptText.scrollTop = transcriptText.scrollHeight;
-                    }
-                    if (msg.type === 'assistant_audio_start') {
-                        status.textContent = 'Jessica is speaking...';
-                        isSpeaking = true;
-                        if (graceTimer) clearTimeout(graceTimer);
-                        activeSources.forEach(src => {
-                            try { src.stop(); } catch(e){}
-                        });
-                        activeSources = [];
-                        audioChunks = [];
-                        nextAudioTime = audioCtx.currentTime;
-                    }
-                    if (msg.type === 'assistant_audio_stop') {
-                        status.textContent = `Connected · Speaking ${langSelect.options[langSelect.selectedIndex].text.split('—')[0].trim()}`;
-                        
-                        if (audioChunks.length > 0) {
-                            const totalLen = audioChunks.reduce((acc, val) => acc + val.length, 0);
-                            const combined = new Uint8Array(totalLen);
-                            let offset = 0;
-                            for (const chunk of audioChunks) {
-                                combined.set(chunk, offset);
-                                offset += chunk.length;
-                            }
-                            
-                            try {
-                                const audioBuffer = await audioCtx.decodeAudioData(combined.buffer);
-                                const src = audioCtx.createBufferSource();
-                                src.buffer = audioBuffer;
-                                src.connect(analyser);
-                                if (nextAudioTime < audioCtx.currentTime + 0.05) {
-                                    nextAudioTime = audioCtx.currentTime + 0.05;
-                                }
-                                src.start(nextAudioTime);
-                                nextAudioTime += audioBuffer.duration;
-                                
-                                activeSources.push(src);
-                                src.onended = () => {
-                                    const idx = activeSources.indexOf(src);
-                                    if (idx > -1) activeSources.splice(idx, 1);
-                                };
-                            } catch (e) {
-                                console.warn('Decode error', e);
-                            }
-                        }
+                if (typeof e.data !== 'string') return;
+                const msg = JSON.parse(e.data);
 
-                        graceTimer = setTimeout(() => {
-                            isSpeaking = false;
-                        }, 800);
+                if (msg.type === 'session_ready') {
+                    console.log('Session ready — starting mic');
+                    startMic(ws);
+                }
+
+                if (msg.type === 'server_error') {
+                    console.error('Server error:', msg.message);
+                    status.textContent = `Error: ${msg.message}`;
+                    status.className = 'error';
+                }
+
+                if (msg.type === 'user_transcript') {
+                    const text = msg.text || '';
+                    let line = document.getElementById('active-line');
+                    if (!line) {
+                        line = document.createElement('div');
+                        line.id = 'active-line';
+                        transcriptText.appendChild(line);
                     }
-                    if (msg.type === 'assistant_audio_chunk') {
-                        const binaryStr = atob(msg.audio_b64);
-                        const len = binaryStr.length;
-                        const bytes = new Uint8Array(len);
-                        for (let i = 0; i < len; i++) {
-                            bytes[i] = binaryStr.charCodeAt(i);
-                        }
-                        audioChunks.push(bytes);
-                    }
-                    return;
+                    line.innerHTML = msg.final
+                        ? `<strong>You:</strong> ${text}`
+                        : `<span class="interim">You: ${text}...</span>`;
+                    if (msg.final) line.id = '';
+                    transcriptText.scrollTop = transcriptText.scrollHeight;
+                }
+
+                if (msg.type === 'assistant_text') {
+                    const div = document.createElement('div');
+                    div.innerHTML = `<strong>Jessica:</strong> ${msg.text}`;
+                    transcriptText.appendChild(div);
+                    transcriptText.scrollTop = transcriptText.scrollHeight;
+                }
+
+                if (msg.type === 'assistant_audio_start') {
+                    console.log('[Audio] Start — clearing buffer');
+                    isSpeaking = true;
+                    if (graceTimer) clearTimeout(graceTimer);
+                    audioChunkBuffers = [];
+                    status.textContent = 'Jessica is speaking...';
+                }
+
+                if (msg.type === 'assistant_audio_chunk') {
+                    if (!msg.audio_b64) return;
+                    const binary = atob(msg.audio_b64);
+                    const bytes = new Uint8Array(binary.length);
+                    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+                    audioChunkBuffers.push(bytes.buffer);
+                    console.log(`[Audio] Chunk ${audioChunkBuffers.length}: ${bytes.length} bytes`);
+                }
+
+                if (msg.type === 'assistant_audio_stop') {
+                    console.log(`[Audio] Stop — playing ${audioChunkBuffers.length} buffered chunks`);
+                    status.textContent = `Connected · ${langSelect.options[langSelect.selectedIndex].text.split('—')[0].trim()}`;
+                    await playBufferedAudio();
+                    graceTimer = setTimeout(() => { isSpeaking = false; }, 1500);
                 }
             };
 
@@ -365,26 +354,30 @@
                 langSelect.disabled = false;
             };
 
+            // MIC context — locked to 16000 Hz to match Deepgram/Sarvam STT expectation
             const startMic = async (socket) => {
-                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-                const micCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
-                console.log(`[Audio] Mic context sample rate: ${micCtx.sampleRate}Hz`);
-                const source = micCtx.createMediaStreamSource(stream);
-                // Use 4096 buffer size for ~85ms stable chunks
-                const processor = micCtx.createScriptProcessor(4096, 1, 1);
-                source.connect(processor);
-                processor.connect(micCtx.destination);
-
-                processor.onaudioprocess = (e) => {
-                    if (socket.readyState !== WebSocket.OPEN) return;
-                    if (isSpeaking) return;
-                    const input = e.inputBuffer.getChannelData(0);
-                    const output = new Int16Array(input.length);
-                    for (let i = 0; i < input.length; i++) {
-                        output[i] = Math.max(-1, Math.min(1, input[i])) * 0x7FFF;
-                    }
-                    socket.send(output.buffer);
-                };
+                try {
+                    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                    const micCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+                    console.log(`[Mic] ${micCtx.sampleRate}Hz`);
+                    const source = micCtx.createMediaStreamSource(stream);
+                    const processor = micCtx.createScriptProcessor(4096, 1, 1);
+                    source.connect(processor);
+                    processor.connect(micCtx.destination);
+                    processor.onaudioprocess = (e) => {
+                        if (socket.readyState !== WebSocket.OPEN || isSpeaking) return;
+                        const input = e.inputBuffer.getChannelData(0);
+                        const pcm = new Int16Array(input.length);
+                        for (let i = 0; i < input.length; i++) {
+                            pcm[i] = Math.max(-32768, Math.min(32767, Math.round(input[i] * 32767)));
+                        }
+                        socket.send(pcm.buffer);
+                    };
+                } catch (err) {
+                    console.error('[Mic] Access denied:', err);
+                    status.textContent = 'Mic access denied';
+                    status.className = 'error';
+                }
             };
         };
 
@@ -394,10 +387,10 @@
             const gain = ctx.createGain();
             osc.connect(gain);
             gain.connect(ctx.destination);
-            gain.gain.setValueAtTime(0.1, ctx.currentTime);
+            gain.gain.setValueAtTime(0.15, ctx.currentTime);
+            osc.frequency.setValueAtTime(440, ctx.currentTime);
             osc.start();
-            osc.stop(ctx.currentTime + 1);
-            console.log('Test beep played');
+            osc.stop(ctx.currentTime + 0.8);
         };
     </script>
 </body>

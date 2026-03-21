@@ -34,7 +34,7 @@ ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
 INPUT_SAMPLE_RATE = int(os.getenv("INPUT_SAMPLE_RATE", "16000"))
 OUTPUT_SAMPLE_RATE = int(os.getenv("OUTPUT_SAMPLE_RATE", "24000"))
 
-ENGLISH_ELEVENLABS_VOICE_ID = "cgSgspJ2msm6clMCkdW9"
+ENGLISH_ELEVENLABS_VOICE_ID = "EXAVITQu4vr4xnSDxMaL"
 ELEVENLABS_MODEL_ID = "eleven_flash_v2_5"
 
 
@@ -493,77 +493,101 @@ class TTSRouter:
                 await session.send_json({"type": "assistant_audio_stop"})
 
     async def _speak_elevenlabs(self, session: SessionState, text: str):
-        if not self.elevenlabs_api_key:
-            await session.send_json({
-                "type": "server_error",
-                "message": "ELEVENLABS_API_KEY is not configured",
-            })
-            return
-
         await session.send_json({"type": "assistant_text", "text": text})
-        await session.send_json({
-            "type": "assistant_audio_start",
-            "provider": "elevenlabs",
-            "voice_id": ENGLISH_ELEVENLABS_VOICE_ID,
-            "format": "mp3",
-            "sample_rate": 44100,
-        })
 
-        url = (
-            f"https://api.elevenlabs.io/v1/text-to-speech/"
-            f"{ENGLISH_ELEVENLABS_VOICE_ID}/stream?output_format=mp3_44100_128"
-        )
+        url = "https://api.openai.com/v1/audio/speech"
         headers = {
-            "xi-api-key": self.elevenlabs_api_key,
-            "accept": "audio/mpeg",
-            "content-type": "application/json",
+            "Authorization": f"Bearer {os.getenv('OPENAI_API_KEY', '')}",
+            "Content-Type": "application/json",
         }
         payload = {
-            "text": text,
-            "model_id": ELEVENLABS_MODEL_ID,
-            "voice_settings": {
-                "stability": 0.45,
-                "similarity_boost": 0.75,
-                "style": 0.10,
-                "use_speaker_boost": True,
-            },
+            "model": "tts-1",
+            "input": text,
+            "voice": "nova",        # nova = warm female voice, closest to Jessica
+            "response_format": "mp3",
+            "speed": 1.0,
         }
 
         try:
-            buffer = bytearray()
-            # Buffer size: roughly 0.4s of audio (24000 Hz * 2 bytes * 0.4s = 19200 bytes)
-            MIN_CHUNK_SIZE = 19200
-
+            full_audio = bytearray()
             async with self.http.stream("POST", url, headers=headers, json=payload) as resp:
                 resp.raise_for_status()
                 async for chunk in resp.aiter_bytes():
                     if session.stop_tts_event.is_set():
-                        break
+                        return
                     if chunk:
-                        buffer.extend(chunk)
-                        if len(buffer) >= MIN_CHUNK_SIZE:
-                            await session.send_audio_chunk(
-                                audio_bytes=bytes(buffer),
-                                fmt="mp3",
-                                sample_rate=44100,
-                            )
-                            buffer.clear()
-                
-                # Send remaining buffer
-                if buffer and not session.stop_tts_event.is_set():
-                    await session.send_audio_chunk(
-                        audio_bytes=bytes(buffer),
-                        fmt="mp3",
-                        sample_rate=44100,
-                    )
+                        full_audio.extend(chunk)
+
+            if full_audio and not session.stop_tts_event.is_set():
+                await session.send_audio_chunk(
+                    audio_bytes=bytes(full_audio),
+                    fmt="mp3",
+                    sample_rate=44100,
+                )
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            logger.exception("ElevenLabs TTS failed: %s", e)
+            logger.exception("OpenAI TTS failed: %s", e)
             await session.send_json({
                 "type": "server_error",
-                "message": f"ElevenLabs TTS failed: {str(e)}",
+                "message": f"OpenAI TTS failed: {str(e)}",
             })
+
+            if not self.elevenlabs_api_key:
+                await session.send_json({
+                    "type": "server_error",
+                    "message": "ELEVENLABS_API_KEY is not configured",
+                })
+                return
+
+            await session.send_json({"type": "assistant_text", "text": text})
+
+            url = (
+                f"https://api.elevenlabs.io/v1/text-to-speech/"
+                f"{ENGLISH_ELEVENLABS_VOICE_ID}/stream?output_format=mp3_44100_128"
+            )
+            headers = {
+                "xi-api-key": self.elevenlabs_api_key,
+                "accept": "audio/mpeg",
+                "content-type": "application/json",
+            }
+            payload = {
+                "text": text,
+                "model_id": ELEVENLABS_MODEL_ID,
+                "voice_settings": {
+                    "stability": 0.45,
+                    "similarity_boost": 0.75,
+                    "style": 0.10,
+                    "use_speaker_boost": True,
+                },
+            }
+
+            try:
+                # Collect ALL audio bytes first — then send as ONE chunk like Sarvam
+                full_audio = bytearray()
+                async with self.http.stream("POST", url, headers=headers, json=payload) as resp:
+                    resp.raise_for_status()
+                    async for chunk in resp.aiter_bytes():
+                        if session.stop_tts_event.is_set():
+                            return
+                        if chunk:
+                            full_audio.extend(chunk)
+
+                if full_audio and not session.stop_tts_event.is_set():
+                    await session.send_audio_chunk(
+                        audio_bytes=bytes(full_audio),
+                        fmt="mp3",
+                        sample_rate=44100,
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.exception("ElevenLabs TTS failed: %s", e)
+                await session.send_json({
+                    "type": "server_error",
+                    "message": f"ElevenLabs TTS failed: {str(e)}",
+                })
+
 
     async def _speak_sarvam(self, session: SessionState, text: str, lang: str):
         if not self.sarvam_api_key:
