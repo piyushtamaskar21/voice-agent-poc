@@ -217,7 +217,7 @@
             const lang = langSelect.value;
             btn.disabled = true;
             langSelect.disabled = true;
-            const audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+            const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
             console.log(`[Audio] Context sample rate: ${audioCtx.sampleRate}Hz`);
             if (audioCtx.state === 'suspended') await audioCtx.resume();
 
