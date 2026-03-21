@@ -217,7 +217,7 @@
             const lang = langSelect.value;
             btn.disabled = true;
             langSelect.disabled = true;
-            const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            const audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
             console.log(`[Audio] Context sample rate: ${audioCtx.sampleRate}Hz`);
             if (audioCtx.state === 'suspended') await audioCtx.resume();
 
@@ -309,21 +309,13 @@
                         }
                         const arrayBuffer = bytes.buffer;
 
-                        if (msg.format === 'pcm_s16le') {
-                            const int16Array = new Int16Array(arrayBuffer);
-                            const float32Array = new Float32Array(int16Array.length);
-                            for (let i = 0; i < int16Array.length; i++) {
-                                float32Array[i] = int16Array[i] / 32768.0;
-                            }
-                            const sampleRate = msg.sample_rate || 24000;
-                            const audioBuffer = audioCtx.createBuffer(1, float32Array.length, sampleRate);
-                            audioBuffer.copyToChannel(float32Array, 0);
-
+                        try {
+                            const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
                             const src = audioCtx.createBufferSource();
                             src.buffer = audioBuffer;
                             src.connect(analyser);
-                            if (nextAudioTime < audioCtx.currentTime) {
-                                nextAudioTime = audioCtx.currentTime;
+                            if (nextAudioTime < audioCtx.currentTime + 0.05) {
+                                nextAudioTime = audioCtx.currentTime + 0.05;
                             }
                             src.start(nextAudioTime);
                             nextAudioTime += audioBuffer.duration;
@@ -333,26 +325,8 @@
                                 const idx = activeSources.indexOf(src);
                                 if (idx > -1) activeSources.splice(idx, 1);
                             };
-                        } else {
-                            try {
-                                const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
-                                const src = audioCtx.createBufferSource();
-                                src.buffer = audioBuffer;
-                                src.connect(analyser);
-                                if (nextAudioTime < audioCtx.currentTime) {
-                                    nextAudioTime = audioCtx.currentTime;
-                                }
-                                src.start(nextAudioTime);
-                                nextAudioTime += audioBuffer.duration;
-                                
-                                activeSources.push(src);
-                                src.onended = () => {
-                                    const idx = activeSources.indexOf(src);
-                                    if (idx > -1) activeSources.splice(idx, 1);
-                                };
-                            } catch (e) {
-                                console.warn('WAV decode error', e);
-                            }
+                        } catch (e) {
+                            console.warn('Decode error', e);
                         }
                     }
                     return;
@@ -376,8 +350,8 @@
             const startMic = async (socket, context) => {
                 const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
                 const source = context.createMediaStreamSource(stream);
-                // Use 1024 buffer size as a stable middle ground
-                const processor = context.createScriptProcessor(1024, 1, 1);
+                // Use 4096 buffer size for ~85ms stable chunks
+                const processor = context.createScriptProcessor(4096, 1, 1);
                 source.connect(processor);
                 processor.connect(context.destination);
 

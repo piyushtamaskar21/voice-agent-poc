@@ -451,7 +451,7 @@ class TTSRouter:
         if not text or not text.strip():
             return
         start_time = time.time()
-        total_bytes = 0
+        total_duration = [0.0]
         try:
             session.stop_tts_event.clear()
             if not session.is_speaking:
@@ -461,8 +461,11 @@ class TTSRouter:
             # Wrap the actual sending to track bytes
             orig_send = session.send_audio_chunk
             async def tracked_send(audio_bytes, fmt="pcm_s16le", sample_rate=OUTPUT_SAMPLE_RATE):
-                nonlocal total_bytes
-                total_bytes += len(audio_bytes)
+                if audio_bytes:
+                    if fmt == "mp3":
+                        total_duration[0] += len(audio_bytes) / 16000.0  # 128kbps MP3
+                    else:
+                        total_duration[0] += len(audio_bytes) / (sample_rate * 2)
                 await orig_send(audio_bytes, fmt, sample_rate)
             
             # Monkeypatch temporarily for this task (simple way to track across adapters)
@@ -474,10 +477,8 @@ class TTSRouter:
             else:
                 await self._speak_sarvam(session, text, lang)
             
-            # Calculate duration. 2 channels * 2 bytes/sample for WAV header impact if added
-            # But we use Mono (1 channel). 2 bytes/sample.
-            # PCM part is Rate * 2 bytes/sec.
-            duration = total_bytes / (OUTPUT_SAMPLE_RATE * 2)
+            # Calculate duration based on the tracked durations of chunks
+            duration = total_duration[0]
             elapsed = time.time() - start_time
             remaining = duration - elapsed
             if remaining > 0 and not session.stop_tts_event.is_set():
@@ -504,17 +505,17 @@ class TTSRouter:
             "type": "assistant_audio_start",
             "provider": "elevenlabs",
             "voice_id": ENGLISH_ELEVENLABS_VOICE_ID,
-            "format": "pcm_s16le",
-            "sample_rate": OUTPUT_SAMPLE_RATE,
+            "format": "mp3",
+            "sample_rate": 44100,
         })
 
         url = (
             f"https://api.elevenlabs.io/v1/text-to-speech/"
-            f"{ENGLISH_ELEVENLABS_VOICE_ID}/stream?output_format=pcm_{OUTPUT_SAMPLE_RATE}"
+            f"{ENGLISH_ELEVENLABS_VOICE_ID}/stream?output_format=mp3_44100_128"
         )
         headers = {
             "xi-api-key": self.elevenlabs_api_key,
-            "accept": "audio/pcm",
+            "accept": "audio/mpeg",
             "content-type": "application/json",
         }
         payload = {
@@ -543,8 +544,8 @@ class TTSRouter:
                         if len(buffer) >= MIN_CHUNK_SIZE:
                             await session.send_audio_chunk(
                                 audio_bytes=bytes(buffer),
-                                fmt="pcm_s16le",
-                                sample_rate=OUTPUT_SAMPLE_RATE,
+                                fmt="mp3",
+                                sample_rate=44100,
                             )
                             buffer.clear()
                 
@@ -552,8 +553,8 @@ class TTSRouter:
                 if buffer and not session.stop_tts_event.is_set():
                     await session.send_audio_chunk(
                         audio_bytes=bytes(buffer),
-                        fmt="pcm_s16le",
-                        sample_rate=OUTPUT_SAMPLE_RATE,
+                        fmt="mp3",
+                        sample_rate=44100,
                     )
         except asyncio.CancelledError:
             raise
