@@ -262,6 +262,11 @@
                         console.log('🚀 Session ready, enabling mic');
                         startMic(ws, audioCtx);
                     }
+                    if (msg.type === 'server_error') {
+                        console.error('❌ Server Error:', msg.message);
+                        status.textContent = `Error: ${msg.message}`;
+                        status.className = 'error';
+                    }
                     if (msg.type === 'user_transcript') {
                         const text = msg.text || '';
                         const isFinal = msg.final;
