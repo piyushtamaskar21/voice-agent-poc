@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-daily_agent.py — Standalone Daily.co AI voice agent
+daily_agent.py — Arios AI Daily.co Voice Agent
+Hybrid STT: Deepgram (EN/HI) + Sarvam (MR)
 Usage:
-    python3 daily_agent.py               # English (default)
+    python3 daily_agent.py               # English
     python3 daily_agent.py --lang hi     # Hindi
     python3 daily_agent.py --lang mr     # Marathi
 """
@@ -10,11 +11,15 @@ Usage:
 import argparse
 import asyncio
 import base64
+import io
 import json
 import logging
 import os
+import struct
 import subprocess
 import threading
+import time
+import wave
 
 import httpx
 import websockets
@@ -36,6 +41,12 @@ SARVAM_API_KEY   = os.getenv("SARVAM_API_KEY", "")
 INPUT_SAMPLE_RATE  = 16000
 OUTPUT_SAMPLE_RATE = 16000
 CHANNELS           = 1
+
+# STT tuning
+VAD_RMS_THRESHOLD  = 100   # chunks below this RMS are silence
+MIN_SPEECH_SECS    = 1.5   # minimum buffered speech before flush
+MAX_BUFFER_SECS    = 6.0   # force flush after this long
+SILENCE_SECS       = 0.8   # flush after this much silence post-speech
 
 SYSTEM_PROMPTS = {
     "en": (
@@ -76,7 +87,7 @@ SYSTEM_PROMPTS = {
     "hi": (
         "You are Jessica, a female AI SDR and receptionist from Arios AI. "
         "Natural Hinglish mein baat karo — jaise real India phone call hoti hai. "
-        "Tone warm, polite, thoda enthusiastic aur patient hona chahiye. "
+        "Tone warm, polite, thodi enthusiastic aur patient hona chahiye. "
         "Robot jaisa bilkul nahi lagna chahiye. "
 
         "Responses short rakho: usually 1 sentence, max 2 short sentences. "
@@ -85,7 +96,7 @@ SYSTEM_PROMPTS = {
         "Conversation style: "
         "Sirf start mein short intro do. "
         "Har response ke baad ek simple question pucho aur ruk jao. "
-        "Natural fillers use karo jaise 'Got it', 'samajh gaya', 'makes sense'. "
+        "Natural fillers use karo jaise 'Got it', 'samajh gayi', 'makes sense'. "
         "User confused ho toh simple explain karo, over-explain mat karo. "
         "Calm aur patient raho. "
 
@@ -103,7 +114,7 @@ SYSTEM_PROMPTS = {
 
         "Important: "
         "Kuch bhi assume mat karo. "
-        "Agar unsure ho toh bolo ki team se confirm karogi. "
+        "Agar unsure ho toh bolo ki main team se confirm kar leti hoon. "
 
         "Goal: "
         "Conversation natural, helpful aur smooth rakhna aur user ko next step tak le jaana."
@@ -111,9 +122,9 @@ SYSTEM_PROMPTS = {
 
     "mr": (
         "You are Jessica, a female AI SDR and receptionist from Arios AI. "
-        "Marathi + English mix madhe natural bolaa — jaise Maharashtra madhe real phone conversation hote. "
-        "Tone warm, polite, thoda enthusiastic ani patient hava. "
-        "Robot sarkha bilkul vatla nahi pahije. "
+        "Marathi + English mix madhe natural bola — jaise Maharashtra madhe real phone conversation hote. "
+        "Tone warm, polite, thodi enthusiastic ani patient hava. "
+        "Robot sarkha bilkul vatayla nako. "
 
         "Responses short theva: usually 1 sentence, max 2 short sentences. "
         "User ne specifically vicharla tarach detail madhe jaa. "
@@ -126,30 +137,32 @@ SYSTEM_PROMPTS = {
         "Calm ani patient raha. "
 
         "Tumcha role: "
-        "Customer queries handle karna like professional call center executive. "
-        "User cha requirement samajhne ani qualify karne. "
-        "Demo kiwa next step sathi guide karne. "
-        "Basic details politely collect karu shakta. "
+        "Customer queries handle karne like professional call center executive. "
+        "User cha requirement samjun gheu shakte ani qualify karu shakte. "
+        "Demo kiwa next step sathi guide karu shakte. "
+        "Basic details politely collect karu shakte. "
 
         "Arios AI kay karto: "
-        "AI systems banavto je business madhla manual kaam automate kartat. "
+        "AI systems banavte je business madhla manual kaam automate kartat. "
         "LLM apps, RAG systems, AI agents, workflow automation. "
         "Voice AI agents, support bots, sales copilots, knowledge assistants. "
-        "Focus ROI var — cost kami, efficiency jasta. "
+        "Focus ROI var — cost kami, efficiency jast. "
 
         "Important: "
         "Kahi hi assume karu naka. "
-        "Jar unsure asal tar sanga ki team sobat confirm karal. "
+        "Jar unsure asal tar sanga ki mi team sobat confirm karte. "
 
         "Goal: "
-        "Conversation natural, helpful ani smooth thevne ani user la next step kade gheun jaan."
+        "Conversation natural, helpful ani smooth thevne ani user la next step kade gheun jane."
     ),
 }
 
 GREETINGS = {
     "en": "Hi, Jessica here from Arios AI. How can I help you today?",
+
     "hi": "Hi, Arios AI se Jessica bol rahi hoon. Aaj main aapki kaise help kar sakti hoon?",
-    "mr": "Hi, Arios AI मधून Jessica बोलतेय. आज मी तुम्हाला कशात help करू शकते?",
+
+    "mr": "Namaste! Mi Jessica, Arios AI madhun bolte. Aaj mi tumhala kashi madad karu shakte?",
 }
 
 
@@ -168,6 +181,32 @@ def mp3_to_pcm16k(mp3_bytes: bytes) -> bytes:
 
 def wav_to_pcm(wav_bytes: bytes) -> bytes:
     return wav_bytes[44:]
+
+
+def pcm_to_wav(pcm_bytes: bytes, sample_rate: int = INPUT_SAMPLE_RATE) -> bytes:
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(CHANNELS)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(pcm_bytes)
+    return buf.getvalue()
+
+
+def get_rms(pcm: bytes) -> float:
+    if len(pcm) < 2:
+        return 0.0
+    samples = struct.unpack(f"{len(pcm)//2}h", pcm)
+    return (sum(s * s for s in samples) / len(samples)) ** 0.5
+
+
+def is_hallucination(transcript: str) -> bool:
+    """Detect repeated word hallucinations like 'बरं बरं बरं बरं...'"""
+    words = transcript.split()
+    if len(words) < 6:
+        return False
+    unique_ratio = len(set(words)) / len(words)
+    return unique_ratio < 0.25
 
 
 # ── LLM ───────────────────────────────────────────────────────────────────────
@@ -211,9 +250,7 @@ class TTS:
                   "voice": "nova", "response_format": "mp3"},
         )
         resp.raise_for_status()
-        pcm = mp3_to_pcm16k(resp.content)
-        logger.info(f"[TTS-EN] {len(pcm)} PCM bytes")
-        return pcm
+        return mp3_to_pcm16k(resp.content)
 
     def _sarvam_tts(self, text: str) -> bytes:
         lang_code = "hi-IN" if self.lang == "hi" else "mr-IN"
@@ -222,23 +259,29 @@ class TTS:
             "https://api.sarvam.ai/text-to-speech",
             headers={"api-subscription-key": SARVAM_API_KEY,
                      "content-type": "application/json"},
-            json={"target_language_code": lang_code, "speaker": "anushka",
-                  "pitch": 0, "pace": 1.0, "loudness": 1.0,
-                  "speech_sample_rate": OUTPUT_SAMPLE_RATE,
-                  "enable_preprocessing": True, "model": "bulbul:v2",
-                  "inputs": [text]},
+            json={
+                "target_language_code": lang_code,
+                "speaker": "ritu",
+                "pace": 1.0,
+                "speech_sample_rate": 16000,
+                "enable_preprocessing": True,
+                "model": "bulbul:v3",   # ← v3: no pitch/loudness params!
+                "inputs": [text],
+            },
         )
-        resp.raise_for_status()
+        if not resp.is_success:
+            logger.error(f"[TTS-Sarvam] {resp.status_code}: {resp.text}")
+            raise RuntimeError(f"Sarvam TTS failed: {resp.status_code}")
         audios = resp.json().get("audios") or []
         if not audios:
-            raise RuntimeError("Sarvam returned no audio")
+            raise RuntimeError("Sarvam TTS returned no audio")
         return wav_to_pcm(base64.b64decode(audios[0]))
 
     def close(self):
         self.http.close()
 
 
-# ── STT ───────────────────────────────────────────────────────────────────────
+# ── STT: Deepgram (EN + HI streaming) ────────────────────────────────────────
 
 class DeepgramSTT:
     def __init__(self, lang: str, on_final_callback):
@@ -248,29 +291,30 @@ class DeepgramSTT:
         self._recv_task = None
         self._connected = False
 
-    def _lang_code(self):
-        # Deepgram doesn't support 'multi' on streaming — use detect_language instead
-        return {"hi": "hi", "mr": "hi"}.get(self.lang, "en")
+    def _build_url(self):
+        lang_code = "hi" if self.lang == "hi" else "en"
+        return (
+            "wss://api.deepgram.com/v1/listen"
+            "?model=nova-2"
+            "&encoding=linear16"
+            f"&sample_rate={INPUT_SAMPLE_RATE}"
+            "&channels=1"
+            "&interim_results=false"
+            "&punctuate=true"
+            "&smart_format=true"
+            "&endpointing=400"
+            f"&language={lang_code}"
+        )
 
     async def connect(self):
-        lang_code = self._lang_code()
-        detect = "&detect_language=true" if self.lang == "mr" else ""
-        url = (
-            "wss://api.deepgram.com/v1/listen"
-            "?encoding=linear16"
-            f"&sample_rate={INPUT_SAMPLE_RATE}"
-            "&channels=1&interim_results=false"
-            "&punctuate=true&smart_format=true&endpointing=400"
-            f"&language={lang_code}{detect}"
-        )
         self.ws = await websockets.connect(
-            url,
+            self._build_url(),
             additional_headers={"Authorization": f"Token {DEEPGRAM_API_KEY}"},
             max_size=None, ping_interval=20, ping_timeout=20,
         )
         self._connected = True
         self._recv_task = asyncio.create_task(self._recv_loop())
-        logger.info("[STT] Deepgram connected")
+        logger.info(f"[STT-Deepgram] Connected — lang={self.lang}")
 
     async def _recv_loop(self):
         try:
@@ -285,12 +329,12 @@ class DeepgramSTT:
                     continue
                 text = (alts[0].get("transcript") or "").strip()
                 if text and data.get("is_final"):
-                    logger.info(f"[STT] Final: {text}")
+                    logger.info(f"[STT-Deepgram] Final: {text}")
                     await self.on_final_callback(text)
         except asyncio.CancelledError:
             pass
         except Exception as e:
-            logger.warning(f"[STT] Disconnected: {e} — will reconnect")
+            logger.warning(f"[STT-Deepgram] Disconnected: {e}")
             self._connected = False
 
     async def send(self, pcm: bytes):
@@ -298,7 +342,7 @@ class DeepgramSTT:
             try:
                 await self.connect()
             except Exception as e:
-                logger.error(f"[STT] Reconnect failed: {e}")
+                logger.error(f"[STT-Deepgram] Reconnect failed: {e}")
                 return
         try:
             await self.ws.send(pcm)
@@ -321,60 +365,184 @@ class DeepgramSTT:
                 pass
 
 
+# ── STT: Sarvam (MR — buffered multipart REST) ───────────────────────────────
+
+class SarvamSTT:
+    def __init__(self, on_final_callback):
+        self.on_final_callback = on_final_callback
+        self.http = httpx.AsyncClient(timeout=30)
+
+        # Speech buffer — only real speech chunks go here
+        self._speech_buf: list[bytes] = []
+        # Pre-speech buffer — last N silence chunks kept for context
+        self._pre_buf: list[bytes] = []
+        self._pre_buf_max = 8  # ~320ms of pre-speech context
+
+        self._lock = asyncio.Lock()
+        self._flush_task = None
+        self._running = False
+        self._last_speech_time = 0.0
+        self._chunk_count = 0
+        self._in_speech = False
+
+    async def start(self):
+        self._running = True
+        self._flush_task = asyncio.create_task(self._flush_loop())
+        logger.info("[STT-Sarvam] Started — lang=mr")
+
+    async def _flush_loop(self):
+        while self._running:
+            await asyncio.sleep(0.3)
+            now = time.time()
+            async with self._lock:
+                speech_secs = sum(len(c) for c in self._speech_buf) / INPUT_SAMPLE_RATE / 2
+                silence_gap = self._in_speech and (now - self._last_speech_time) > SILENCE_SECS
+                max_hit     = speech_secs >= MAX_BUFFER_SECS
+
+            if speech_secs >= MIN_SPEECH_SECS and (silence_gap or max_hit):
+                reason = "silence" if silence_gap else "max_buffer"
+                logger.info(f"[STT-Sarvam] Flush — reason={reason} speech={speech_secs:.1f}s")
+                await self._flush()
+
+    async def _flush(self):
+        async with self._lock:
+            if not self._speech_buf:
+                return
+            # Prepend pre-speech context for better transcription
+            pcm = b"".join(self._pre_buf + self._speech_buf)
+            self._speech_buf.clear()
+            self._pre_buf.clear()
+            self._in_speech = False
+
+        duration = len(pcm) / INPUT_SAMPLE_RATE / 2
+        logger.info(f"[STT-Sarvam] Sending {duration:.1f}s to Sarvam API...")
+        wav = pcm_to_wav(pcm)
+
+        try:
+            resp = await self.http.post(
+                "https://api.sarvam.ai/speech-to-text",
+                headers={"api-subscription-key": SARVAM_API_KEY},
+                files={"file": ("audio.wav", io.BytesIO(wav), "audio/wav")},
+                data={
+                    "model": "saarika:v2.5",
+                    "language_code": "mr-IN",
+                    "with_timestamps": "false",
+                },
+            )
+            if not resp.is_success:
+                logger.error(f"[STT-Sarvam] {resp.status_code}: {resp.text}")
+                return
+            transcript = (resp.json().get("transcript") or "").strip()
+            if not transcript:
+                logger.info("[STT-Sarvam] Empty transcript")
+                return
+            if is_hallucination(transcript):
+                logger.info(f"[STT-Sarvam] Hallucination filtered: {transcript[:60]}...")
+                return
+            logger.info(f"[STT-Sarvam] Final: {transcript}")
+            await self.on_final_callback(transcript)
+        except Exception as e:
+            logger.error(f"[STT-Sarvam] Exception: {e}")
+
+    async def send(self, pcm: bytes):
+        rms = get_rms(pcm)
+        async with self._lock:
+            self._chunk_count += 1
+            n = self._chunk_count
+
+            if n == 1:
+                logger.info(f"[Audio] First chunk — RMS={rms:.1f} size={len(pcm)}")
+
+            if rms > VAD_RMS_THRESHOLD:
+                # Real speech
+                if not self._in_speech:
+                    logger.info(f"[STT-Sarvam] Speech started — RMS={rms:.0f}")
+                    self._in_speech = True
+                self._speech_buf.append(pcm)
+                self._last_speech_time = time.time()
+            else:
+                # Silence — keep rolling pre-speech context
+                self._pre_buf.append(pcm)
+                if len(self._pre_buf) > self._pre_buf_max:
+                    self._pre_buf.pop(0)
+
+            speech_secs = sum(len(c) for c in self._speech_buf) / INPUT_SAMPLE_RATE / 2
+            if n % 100 == 0:
+                logger.info(f"[STT-Sarvam] chunk #{n} RMS={rms:.0f} speech_buf={speech_secs:.1f}s in_speech={self._in_speech}")
+
+    async def close(self):
+        self._running = False
+        if self._flush_task:
+            self._flush_task.cancel()
+            try:
+                await self._flush_task
+            except Exception:
+                pass
+        await self._flush()
+        await self.http.aclose()
+
+
 # ── Daily EventHandler ────────────────────────────────────────────────────────
 
 class _DailyHandler(EventHandler):
     def __init__(self):
         EventHandler.__init__(self)
-        self._agent = None   # injected by DailyAgent
+        self._agent = None
 
     def on_participant_joined(self, participant):
-        name = participant.get("info", {}).get("userName", "?")
-        pid  = participant.get("id", "")
+        name     = participant.get("info", {}).get("userName", "?")
+        pid      = participant.get("id", "")
         is_local = participant.get("info", {}).get("isLocal", False)
         logger.info(f"[Daily] Participant joined: {name} (local={is_local})")
 
-        # Skip the bot's own audio — only subscribe to remote humans
         if is_local or not pid or not self._agent:
             return
 
         agent = self._agent
+        counter = {"n": 0}
 
-        # ── Key fix: use set_audio_renderer per participant ──
         def on_audio_data(participant_id, audio_data, *args):
-            if agent._is_speaking:
-                return
             try:
-                pcm = audio_data.audio_frames   # daily.AudioData object
+                pcm = bytes(audio_data.audio_frames)
             except AttributeError:
                 pcm = bytes(audio_data)
-            if pcm and agent._loop:
+
+            counter["n"] += 1
+            n = counter["n"]
+
+            if n == 1:
+                logger.info(f"[Audio] First chunk! size={len(pcm)} is_speaking={agent._is_speaking}")
+            if n % 200 == 0:
+                logger.info(f"[Audio] Flowing — chunk #{n} size={len(pcm)} is_speaking={agent._is_speaking}")
+
+            if not pcm or agent._is_speaking:
+                return
+
+            if agent._loop:
                 asyncio.run_coroutine_threadsafe(
-                    agent.stt.send(bytes(pcm)), agent._loop
+                    agent.stt.send(pcm), agent._loop
                 )
 
         try:
             agent.client.set_audio_renderer(
-                pid,
-                on_audio_data,
+                pid, on_audio_data,
                 audio_source="microphone",
                 sample_rate=INPUT_SAMPLE_RATE,
             )
-            logger.info(f"[Daily] Audio renderer set for: {name}")
+            logger.info(f"[Daily] Audio renderer set for: {name} ✓")
         except Exception as e:
             logger.error(f"[Daily] set_audio_renderer failed: {e}")
 
-        # Also update subscription
         try:
             agent.client.update_subscriptions(
                 participant_settings={pid: {"media": "subscribed"}}
             )
+            logger.info(f"[Daily] Subscriptions updated for: {name} ✓")
         except Exception as e:
             logger.error(f"[Daily] update_subscriptions failed: {e}")
 
     def on_participant_left(self, participant, reason):
-        name = participant.get("info", {}).get("userName", "?")
-        logger.info(f"[Daily] Participant left: {name} ({reason})")
+        logger.info(f"[Daily] Left: {participant.get('info',{}).get('userName','?')} ({reason})")
 
     def on_error(self, message):
         logger.error(f"[Daily] Error: {message}")
@@ -395,6 +563,13 @@ class DailyAgent:
         self._is_speaking  = False
         self._joined_event = threading.Event()
 
+    def _build_stt(self, callback):
+        if self.lang == "mr":
+            logger.info("[STT] Using Sarvam STT — lang=mr")
+            return SarvamSTT(on_final_callback=callback)
+        logger.info(f"[STT] Using Deepgram STT — lang={self.lang}")
+        return DeepgramSTT(lang=self.lang, on_final_callback=callback)
+
     async def run(self):
         self._loop      = asyncio.get_event_loop()
         self._turn_lock = asyncio.Lock()
@@ -402,11 +577,13 @@ class DailyAgent:
         async def on_transcript(text: str):
             await self._handle_transcript(text)
 
-        self.stt = DeepgramSTT(self.lang, on_transcript)
-        await self.stt.connect()
+        self.stt = self._build_stt(on_transcript)
+        if isinstance(self.stt, SarvamSTT):
+            await self.stt.start()
+        else:
+            await self.stt.connect()
 
         Daily.init()
-
         self.mic = Daily.create_microphone_device(
             "agent-mic",
             sample_rate=OUTPUT_SAMPLE_RATE,
