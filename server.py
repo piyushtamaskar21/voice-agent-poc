@@ -377,11 +377,11 @@ class SarvamSTTAdapter(BaseSTTAdapter):
         if self.closed or not self.ws or not pcm:
             return
         try:
-            # SDK expects base64 encoded audio for the transcribe method
-            audio_b64 = base64.b64encode(pcm).decode("utf-8")
+            wav_bytes = add_wav_header(pcm, sample_rate=INPUT_SAMPLE_RATE)
+            audio_b64 = base64.b64encode(wav_bytes).decode("utf-8")
             await self.ws.transcribe(
                 audio=audio_b64,
-                encoding="audio/wav",  # SDK explicitly requires audio/wav (Pydantic validation)
+                encoding="audio/wav",
                 sample_rate=INPUT_SAMPLE_RATE,
             )
         except Exception as e:
@@ -530,8 +530,8 @@ class TTSRouter:
 
         try:
             buffer = bytearray()
-            # Buffer size: roughly 0.1s of audio (24000 Hz * 2 bytes * 0.1s = 4800 bytes)
-            MIN_CHUNK_SIZE = 4800 
+            # Buffer size: roughly 0.4s of audio (24000 Hz * 2 bytes * 0.4s = 19200 bytes)
+            MIN_CHUNK_SIZE = 19200
 
             async with self.http.stream("POST", url, headers=headers, json=payload) as resp:
                 resp.raise_for_status()
@@ -827,7 +827,6 @@ async def websocket_entry(ws: WebSocket):
             if "bytes" in msg and msg["bytes"] is not None:
                 audio = msg["bytes"]
                 if audio:
-                    await session.interrupt_speech()
                     await session.stt.send_audio(audio)
                 continue
 
