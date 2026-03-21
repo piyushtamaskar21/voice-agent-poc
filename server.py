@@ -806,11 +806,6 @@ async def websocket_entry(ws: WebSocket):
             "output_sample_rate": OUTPUT_SAMPLE_RATE,
         })
 
-        # Diagnostic: Send a small 0.5s beep at 16k directly to test audio path
-        print(f"DEBUG: Session {session.session_id} - Sending diagnostic beep")
-        diagnostic_pcm = (b'\x00\x00\x3f\x3f' * 2000) # Simple noise/square wave
-        await session.send_audio_chunk(diagnostic_pcm, fmt="pcm_s16le", sample_rate=16000)
-
         await send_opening_greeting(session)
 
         while True:
